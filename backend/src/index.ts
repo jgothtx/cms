@@ -1,29 +1,34 @@
-import dotenv from 'dotenv';
-import { database } from './database';
-import { createApp } from './app';
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import path from 'path';
+import apiRouter from './routes';
+import { seed } from './seed';
 
-dotenv.config();
+const app = express();
+const PORT = Number(process.env.PORT) || 3001;
 
-const PORT = process.env.PORT || 3000;
-const app = createApp();
+app.use(cors());
+app.use(express.json());
 
-// Initialize database and start server
-export async function start() {
-  try {
-    await database.initialize();
-    console.log('Database initialized');
+// Serve uploaded files
+app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
 
-    app.listen(PORT, () => {
-      console.log(`Server running on http://localhost:${PORT}`);
-    });
-  } catch (err) {
-    console.error('Failed to start server:', err);
-    process.exit(1);
-  }
-}
+// API routes
+app.use('/api', apiRouter);
 
-if (require.main === module) {
-  start();
-}
+// Serve frontend in production
+const frontendDist = process.env.FRONTEND_DIST || path.join(__dirname, '..', '..', 'frontend', 'dist');
+app.use(express.static(frontendDist));
+app.get('*', (_req, res) => {
+  res.sendFile(path.join(frontendDist, 'index.html'));
+});
 
-export { app };
+// Seed on startup
+seed();
+
+app.listen(PORT, () => {
+  console.log(`Backend running on http://localhost:${PORT}`);
+});
+
+export default app;

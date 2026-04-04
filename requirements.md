@@ -16,10 +16,15 @@ This phase delivers an MVP focused on contract intake, tracking, reminders, and 
 - Basic user roles (Admin, Contract Manager, Viewer)
 - Activity log on contract changes
 - Document metadata tracking (not full DMS)
+- OCR-driven contract upload with AI extraction (OpenAI / Anthropic)
+- Soft-delete semantics for contracts (archive) and vendors (deactivate)
+- Duplicate vendor name prevention (case-insensitive)
+- Contract archive and restore lifecycle
+- Vendor deactivate action separate from delete
+- Contract and vendor detail (read-only) screens
 
 ### Out of Scope (MVP)
 - E-signature workflow integration
-- AI clause extraction
 - ERP/Procurement integrations
 - Full legal redlining workflow
 - Full production Okta tenant setup and SSO hardening (API auth must be JWT-based and Okta-compatible)
@@ -44,19 +49,46 @@ This phase delivers an MVP focused on contract intake, tracking, reminders, and 
   - Email and phone
   - Category
   - Risk tier (Low, Medium, High)
+- Vendor legal name must be unique (case-insensitive, trimmed). Duplicate creation returns 409 Conflict.
+- On application startup, existing duplicate vendor names are de-duplicated before the unique index is applied.
+- Delete vendor (Admin only): sets vendor status to Inactive (soft delete). Does not remove the record.
+- Deactivate vendor (Writer role): sets vendor status to Inactive. If already Inactive, returns the vendor unchanged.
+- Vendor detail page: read-only view showing all profile fields with an edit link for authorized users.
+- Vendor edit page loads existing vendor data into the form.
 
 ### FR-3 Contract Management
 - Create/edit contract with:
   - Contract title (required)
-  - Vendor (required)
-  - Contract owner (required)
+  - Vendor (required, searchable autocomplete)
+  - Contract owner (required, free-text name or email)
   - Start date, end date (required)
+  - External reference id
+  - Contract type
+  - Description
+  - Parent contract (searchable autocomplete)
+  - Effective date, signature date, termination date
+  - Initial term months, renewal term months
   - Auto-renew boolean
   - Notice period days
   - Contract value and currency
-  - Status (Draft, Under Review, Active, Expiring Soon, Expired, Terminated)
+  - Billing frequency
+  - Payment terms
+  - Cost center code, spend category
+  - Price escalation terms
+  - Risk tier
+  - Data classification
   - Compliance flags (Insurance, SOC2, Data Processing Agreement)
+  - Audit rights flag
+  - Compliance exceptions, regulatory tags
+  - Key obligations, SLA terms, service credits terms
   - Notes
+  - Status (Draft, Under Review, Active, Expiring Soon, Expired, Terminated)
+- Contract form is organized into sections: Core Information, Dates and Term, Financials, Risk and Compliance, Obligations and Notes.
+- Contract edit page loads existing contract data into the form.
+- Contract detail page: multi-section read-only view showing all stored fields with an edit link for authorized users.
+- Delete contract (Writer role): soft-deletes by setting `archived=true` and `status='Archived'`.
+- Archive contract (Writer role): explicitly archives a contract via `POST /contracts/:id/archive`. Sets `archived=true` but preserves the current status value.
+- Restore contract (Admin only): restores an archived contract via `POST /contracts/:id/restore`. Sets `archived=false` and resets `status` to `Draft`.
 - Soft-delete/archive contracts
 
 ### FR-4 Search and Filtering
@@ -78,8 +110,29 @@ This phase delivers an MVP focused on contract intake, tracking, reminders, and 
 - Record actor name and change summary
 
 ### FR-7 Reporting (MVP)
-- Export current contract list to CSV
+- Export current contract list to CSV via `GET /api/contracts/export.csv`.
+  - Exported columns: id, title, vendor_id, contract_owner, status, start_date, end_date, contract_value, currency, risk_tier, auto_renew.
+  - Archived contracts are excluded from the export.
 - Display simple summary table on dashboard
+
+### FR-8 OCR Contract Upload
+- Upload a scanned contract image (PNG, JPEG, WebP) or PDF via a dedicated upload page.
+- File size limit: 10 MB.
+- OCR extraction is performed by OpenAI or Anthropic, configured via backend environment variables:
+  - `OPENAI_API_KEY` and optional `OPENAI_OCR_MODEL` (default: `gpt-4.1-mini`)
+  - `ANTHROPIC_API_KEY` and optional `ANTHROPIC_OCR_MODEL` (default: `claude-3-5-sonnet-latest`)
+- Provider selection: user may choose Auto, OpenAI, or Anthropic. Auto selects the first configured provider; PDF uploads prefer Anthropic when available.
+- The OCR model is instructed to return a strict JSON spec matching the contract, vendor, relationship, and document metadata schemas. The extraction spec is available via `GET /api/contracts/upload/spec`.
+- Extracted values are normalized: dates to YYYY-MM-DD, booleans to true/false, risk tier to Low/Medium/High, status to the controlled enum, currency amounts cleaned of formatting.
+- Vendor resolution: the extracted vendor legal name is matched (case-insensitive) against existing vendors. If no match, a new Active vendor is created automatically with all extracted profile fields.
+- Parent contract resolution: if the OCR output includes a parent contract reference, the system attempts to resolve it by id, external reference id, or exact title match.
+- On successful extraction: a contract record, document metadata row, and optionally a new vendor are created in a single request.
+- The uploaded file is saved to disk under `uploads/contracts/{contractId}/` with a SHA-256 checksum stored in document metadata.
+- The response includes the created contract, vendor, document metadata, raw extracted JSON, provider used, and relation resolution results.
+- If the OCR output fails contract validation (e.g., missing required fields), a 422 response is returned with the extracted data and validation errors so the user can see what was extracted.
+- The upload page displays: file input, provider selector, the expected JSON spec, and after submission shows created records, links to the contract and vendor, and the raw extracted JSON.
+- Upload requires Writer role (Admin or Contract Manager).
+- Navigation: the upload page is accessible from the sidebar and from an "Upload Contract" button on the contract list page.
 
 ## 5. Non-Functional Requirements
 - Usability: Responsive UI for desktop and tablet
@@ -99,7 +152,7 @@ Required fields:
 - Contract id (system-generated)
 - Contract title
 - Vendor id (foreign key)
-- Contract owner user id
+- Contract owner (free-text name or email; not a user foreign key)
 - Start date
 - End date
 - Status
@@ -147,17 +200,22 @@ Optional fields:
 Controlled enums:
 - Status: Draft, Under Review, Active, Expiring Soon, Expired, Terminated, Archived
 - Risk tier: Low, Medium, High
+- Billing frequency: Monthly, Quarterly, Semi-Annual, Annual, One-Time, Usage-Based
+- Data classification: Public, Internal, Confidential, Restricted
 
 ### DR-2 Vendor Entity
 System must store vendor profile fields.
 
 Required fields:
 - Vendor id (system-generated)
-- Vendor legal name
+- Vendor legal name (unique, case-insensitive)
 - Vendor status (Active, Inactive)
 - Risk tier
 - Created at
 - Updated at
+
+Constraints:
+- Unique index on `lower(trim(legal_name))`. On startup, existing duplicates are removed (keeping the earliest record) before the index is applied.
 
 Optional fields:
 - DBA name
@@ -252,8 +310,12 @@ Optional fields:
 - Contract value cannot be negative
 - Contract owner does not need to reference an active user account
 - Vendor id must reference an existing vendor
-- Archived contracts cannot be edited except by Admin restore action
+- Archived contracts cannot be edited except by Admin restore action. Non-admin users who attempt to edit an archived contract receive a 403 response.
 - All stored timestamps must be UTC
+- Vendor legal name must be unique (case-insensitive, trimmed). Duplicate attempts return 409 Conflict with `field: 'legal_name'`.
+- Parent contract id, when provided, must reference an existing contract. Self-referencing (parent_contract_id == contract id) is rejected on update.
+- Vendor id must be validated on contract update as well as create.
+- OCR upload: if extraction produces an invalid contract payload (missing required fields), the endpoint returns 422 with the extracted data and validation error details.
 
 ## 8. Acceptance Criteria
 1. User can create a vendor and create a contract linked to that vendor.
@@ -262,6 +324,15 @@ Optional fields:
 4. Expired and expiring contracts are visually distinct.
 5. CSV export downloads the currently filtered list.
 6. Activity log updates when contract changes are saved.
+7. Vendor with a duplicate legal name (case-insensitive) is rejected with a 409 response.
+8. Deleting a vendor sets it to Inactive; deleting a contract archives it.
+9. Contract detail page displays all stored contract fields across organized sections.
+10. Contract edit page loads and hydrates existing contract data.
+11. Vendor detail page displays all stored vendor profile fields.
+12. Vendor edit page loads and hydrates existing vendor data.
+13. Uploading a contract image or PDF via the upload form extracts structured data and creates the contract, vendor (if new), and document metadata.
+14. OCR upload resolves parent contract references when the extracted data includes a matching id, external reference, or title.
+15. Admin can restore an archived contract. Non-admins cannot.
 
 ## 9. Technical Delivery Approach
 - Frontend: Vue 3 + TypeScript SPA using Vuetify.
@@ -279,24 +350,44 @@ Optional fields:
 
 ## 11. API Requirements (MVP)
 - REST endpoints (minimum):
+  - `GET /api/health` — unauthenticated health check
   - `GET/POST /api/vendors`
   - `GET/PATCH/DELETE /api/vendors/:id`
+  - `POST /api/vendors/:id/deactivate` — sets vendor Inactive (Writer role)
   - `GET/POST /api/contracts`
   - `GET/PATCH/DELETE /api/contracts/:id`
+  - `POST /api/contracts/:id/archive` — archives a contract (Writer role)
+  - `POST /api/contracts/:id/restore` — restores an archived contract (Admin only)
+  - `GET /api/contracts/upload/spec` — returns the OCR JSON extraction spec and configured providers (Writer role)
+  - `POST /api/contracts/upload` — multipart file upload with OCR extraction, contract+vendor+document creation (Writer role)
   - `GET/POST /api/contracts/:id/reminders`
   - `PATCH /api/reminders/:id`
   - `GET /api/dashboard/summary`
   - `GET /api/contracts/export.csv`
 - API responses should include validation errors with field-level details.
 - List endpoints should support pagination, filtering, and sorting.
+- Duplicate vendor creation returns 409 Conflict with field-level error.
+- Contract delete returns the soft-deleted (archived) result.
+- Vendor delete returns the updated vendor with Inactive status.
 
 ## 12. Authorization Rules (MVP)
-- Admin: full CRUD on users, vendors, contracts, reminders.
-- Contract Manager: CRUD vendors/contracts/reminders, no user administration.
+- Admin: full CRUD on users, vendors, contracts, reminders. Only role that can delete vendors or restore archived contracts.
+- Contract Manager: CRUD vendors/contracts/reminders (except vendor delete and contract restore), no user administration.
 - Viewer: read-only access to dashboard, vendors, contracts, reminders.
 - Every modifying API call must enforce role checks.
+- Specific per-action role requirements:
+  - Vendor create/update: Writer (Admin or Contract Manager)
+  - Vendor delete (soft-delete to Inactive): Admin only
+  - Vendor deactivate: Writer (Admin or Contract Manager)
+  - Contract create/update: Writer
+  - Contract delete (soft-delete via archive): Writer
+  - Contract archive: Writer
+  - Contract restore: Admin only
+  - Contract upload (OCR): Writer
+  - Reminder create/update: Writer
 - API authentication uses JWT tokens in the Authorization header.
 - JWT validation must be implemented behind a provider abstraction so Okta integration can be enabled without changing authorization logic.
+- Authenticated users are automatically provisioned in the users table on first API request to ensure foreign key integrity for audit logging.
 
 ## 13. Audit and Data Handling
 - Activity log events are append-only (no update/delete from UI).

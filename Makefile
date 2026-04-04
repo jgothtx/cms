@@ -1,101 +1,52 @@
-.PHONY: help install frontend backend dev all build clean seed
+NODE_VERSION := 20
+NVM_USE := . "$${NVM_DIR}/nvm.sh" && nvm use $(NODE_VERSION)
 
-# Default target
-help:
-	@echo "Contract Management System - Available Commands"
-	@echo "=============================================="
-	@echo ""
-	@echo "Development:"
-	@echo "  make frontend         Start frontend dev server (port 5173)"
-	@echo "  make backend          Start backend dev server (port 3000)"
-	@echo "  make dev              Start both frontend and backend (concurrent)"
-	@echo "  make all              Alias for 'make dev'"
-	@echo ""
-	@echo "Setup:"
-	@echo "  make install          Install dependencies for frontend and backend"
-	@echo "  make seed             Seed database with sample data"
-	@echo ""
-	@echo "Build:"
-	@echo "  make build            Build both frontend and backend for production"
-	@echo "  make build-frontend   Build frontend only"
-	@echo "  make build-backend    Build backend only"
-	@echo ""
-	@echo "Cleanup:"
-	@echo "  make clean            Remove node_modules and build artifacts"
-	@echo "  make help             Show this help message"
-	@echo ""
+.PHONY: install dev dev-backend dev-frontend build seed clean reset test docker docker-run docker-stop help
 
-# Install dependencies
-install:
-	@echo "Installing dependencies..."
-	cd backend && npm install
-	cd frontend && npm install
-	@echo "✓ Dependencies installed"
+help: ## Show this help
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
 
-# Frontend development server
-frontend:
-	@echo "Starting frontend dev server on http://localhost:5173..."
-	cd frontend && npm run dev
+install: ## Install all dependencies
+	$(NVM_USE) && cd backend && npm install
+	$(NVM_USE) && cd frontend && npm install
 
-# Backend development server
-backend:
-	@echo "Starting backend dev server on http://localhost:3000..."
-	cd backend && npm run dev
+dev: ## Run backend and frontend concurrently
+	$(NVM_USE) && npx concurrently -n be,fe -c blue,green "cd backend && npm run dev" "cd frontend && npm run dev"
 
-# Run both concurrently
-dev: 
-	@echo "Starting frontend and backend concurrently..."
-	@echo "Frontend: http://localhost:5173"
-	@echo "Backend: http://localhost:3000"
-	@echo ""
-	@echo "Press Ctrl+C to stop both servers"
-	@echo ""
-	@(cd frontend && npm run dev) & \
-	(cd backend && npm run dev) & \
-	wait
+dev-backend: ## Run backend only
+	$(NVM_USE) && cd backend && npm run dev
 
-# Alias for dev
-all: dev
+dev-frontend: ## Run frontend only
+	$(NVM_USE) && cd frontend && npm run dev
 
-# Build for production
-build: build-backend build-frontend
-	@echo "✓ Both frontend and backend built successfully"
+build: ## Build frontend for production
+	$(NVM_USE) && cd frontend && npm run build
 
-# Build backend only
-build-backend:
-	@echo "Building backend..."
-	cd backend && npm run build
-	@echo "✓ Backend built to backend/dist"
+seed: ## Re-seed the database (deletes existing data)
+	rm -f backend/contracts.db
+	$(NVM_USE) && cd backend && npm run seed
 
-# Build frontend only
-build-frontend:
-	@echo "Building frontend..."
-	cd frontend && npm run build
-	@echo "✓ Frontend built to frontend/dist"
+clean: ## Remove build artifacts and databases
+	rm -f backend/contracts.db
+	rm -rf backend/dist
+	rm -rf frontend/dist
 
-# Seed database
-seed:
-	@echo "Seeding database with sample data..."
-	cd backend && npx ts-node src/seed.ts
-	@echo "✓ Database seeded"
+reset: clean install seed ## Clean, reinstall, and re-seed
 
-# Clean up
-clean:
-	@echo "Cleaning up..."
-	rm -rf frontend/node_modules frontend/dist
-	rm -rf backend/node_modules backend/dist
-	@echo "✓ Cleanup complete"
+test: ## Run backend type-check and frontend build check
+	$(NVM_USE) && cd backend && npx tsc --noEmit
+	$(NVM_USE) && cd frontend && npx vue-tsc --noEmit
 
-# Run tests
-test:
-	@echo "Running tests..."
-	cd backend && npm run test
-	cd frontend && npm run test
-	@echo "✓ Tests complete"
+docker: ## Build Docker image
+	docker build -t contract-management .
 
-# Run linter
-lint:
-	@echo "Linting..."
-	cd backend && npm run build
-	cd frontend && npm run build
-	@echo "✓ Linting complete"
+docker-run: ## Run Docker container (pass ANTHROPIC_API_KEY)
+	docker run -d --name contract-mgmt \
+		-p 3001:3001 \
+		-v contract-mgmt-data:/app/data \
+		-v contract-mgmt-uploads:/app/backend/uploads \
+		--env-file backend/.env \
+		contract-management
+
+docker-stop: ## Stop and remove Docker container
+	docker stop contract-mgmt && docker rm contract-mgmt

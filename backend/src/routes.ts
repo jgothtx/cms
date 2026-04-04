@@ -1,624 +1,346 @@
-import { Router, Response } from 'express';
-import { randomUUID } from 'crypto';
-import { AuthRequest, requireWriter, requireAdmin, requireRole } from './auth';
-import { database } from './database';
-import { 
-  VendorRepository, ContractRepository, ReminderRepository, 
-  ActivityEventRepository, UserRepository 
-} from './repositories';
-import { validateContract, validateVendor, validateReminder } from './validators';
-import { Contract, Vendor, Reminder } from './models';
+import { Router, Request, Response } from 'express';
+import multer from 'multer';
+import * as repo from './repositories';
+import { authenticate, requireWriter, requireAdmin } from './auth';
+import { getExtractionSpec, getConfiguredProviders, extractContractData, saveUploadedFile, computeChecksum } from './ocr';
+import { getDb } from './database';
+import fs from 'fs';
 
 const router = Router();
+const upload = multer({ dest: 'uploads/tmp/', limits: { fileSize: 10 * 1024 * 1024 } });
 
-const vendorRepo = new VendorRepository();
-const contractRepo = new ContractRepository();
-const reminderRepo = new ReminderRepository();
-const activityRepo = new ActivityEventRepository();
-const userRepo = new UserRepository();
+function qs(val: any): string | undefined {
+  if (typeof val === 'string') return val;
+  if (Array.isArray(val)) return val[0] as string;
+  return undefined;
+}
 
-// ===== VENDOR ENDPOINTS =====
+// Health
+router.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-// GET /api/vendors - List all vendors
-router.get('/vendors', async (req: AuthRequest, res: Response) => {
+// Auth - dev token generator
+router.post('/auth/token', (req: Request, res: Response) => {
+  if (process.env.NODE_ENV === 'production') { res.status(404).json({ error: 'Not found' }); return; }
+  const { generateToken } = require('./auth');
+  const { sub, name, email, role } = req.body;
+  const token = generateToken({ sub: sub || 'dev-user', name: name || 'Dev User', email: email || 'dev@example.com', role: role || 'Admin' });
+  res.json({ token });
+});
+
+// All API routes require auth
+router.use(authenticate);
+
+// ---- Users ----
+router.get('/users', requireAdmin, (_req: Request, res: Response) => {
+  res.json(repo.listUsers());
+});
+
+// ---- Vendors ----
+router.get('/vendors', (req: Request, res: Response) => {
+  const result = repo.listVendors({
+    search: qs(req.query.search),
+    status: qs(req.query.status),
+    category: qs(req.query.category),
+    risk_tier: qs(req.query.risk_tier),
+    sort: qs(req.query.sort),
+    order: qs(req.query.order),
+    page: Number(req.query.page) || 1,
+    limit: Number(req.query.limit) || 50,
+  });
+  res.json(result);
+});
+
+router.get('/vendors/:id', (req: Request, res: Response) => {
+  const vendor = repo.getVendor(req.params.id);
+  if (!vendor) { res.status(404).json({ error: 'Vendor not found' }); return; }
+  res.json(vendor);
+});
+
+router.post('/vendors', requireWriter, (req: Request, res: Response) => {
+  const { legal_name } = req.body;
+  if (!legal_name?.trim()) {
+    res.status(400).json({ error: 'Vendor legal name is required', field: 'legal_name' }); return;
+  }
   try {
-    const limit = Math.min(parseInt(req.query.limit as string) || 100, 1000);
-    const offset = parseInt(req.query.offset as string) || 0;
-    const vendors = await vendorRepo.findAll(limit, offset);
-    res.json({ data: vendors, count: vendors.length });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch vendors' });
+    const vendor = repo.createVendor(req.body, req.user!.id);
+    res.status(201).json(vendor);
+  } catch (err: any) {
+    if (err.message?.includes('UNIQUE constraint')) {
+      res.status(409).json({ error: 'Vendor with this legal name already exists', field: 'legal_name' }); return;
+    }
+    throw err;
   }
 });
 
-// POST /api/vendors - Create vendor
-router.post('/vendors', requireWriter, async (req: AuthRequest, res: Response) => {
-  try {
-    const validation = validateVendor(req.body);
-    if (!validation.isValid()) {
-      res.status(400).json(validation.toResponse());
-      return;
-    }
-
-    const duplicate = await vendorRepo.findByLegalNameNormalized(req.body.legal_name);
-    if (duplicate) {
-      res.status(409).json({
-        error: {
-          field: 'legal_name',
-          message: 'A vendor with this legal name already exists'
-        }
-      });
-      return;
-    }
-
-    const now = new Date().toISOString();
-    const vendor: Vendor = {
-      id: randomUUID(),
-      legal_name: req.body.legal_name,
-      dba_name: req.body.dba_name,
-      category: req.body.category,
-      status: req.body.status || 'Active',
-      risk_tier: req.body.risk_tier,
-      tax_id: req.body.tax_id,
-      website: req.body.website,
-      primary_contact_name: req.body.primary_contact_name,
-      primary_contact_email: req.body.primary_contact_email,
-      primary_contact_phone: req.body.primary_contact_phone,
-      billing_contact_name: req.body.billing_contact_name,
-      billing_contact_email: req.body.billing_contact_email,
-      billing_address: req.body.billing_address,
-      country: req.body.country,
-      performance_rating: req.body.performance_rating,
-      notes: req.body.notes,
-      created_at: now,
-      updated_at: now
-    };
-
-    const created = await vendorRepo.create(vendor);
-    await activityRepo.logActivity(req.user!.id, 'Vendor', vendor.id, 'Create', `Created vendor: ${vendor.legal_name}`);
-    res.status(201).json(created);
-  } catch (err) {
-    if ((err as Error).message.includes('UNIQUE constraint failed')) {
-      res.status(409).json({
-        error: {
-          field: 'legal_name',
-          message: 'A vendor with this legal name already exists'
-        }
-      });
-      return;
-    }
-    res.status(500).json({ error: 'Failed to create vendor' });
+router.patch('/vendors/:id', requireWriter, (req: Request, res: Response) => {
+  if (req.body.legal_name !== undefined && !req.body.legal_name?.trim()) {
+    res.status(400).json({ error: 'Vendor legal name cannot be empty', field: 'legal_name' }); return;
   }
-});
-
-// GET /api/vendors/:id
-router.get('/vendors/:id', async (req: AuthRequest, res: Response) => {
   try {
-    const vendor = await vendorRepo.findById(req.params.id as string);
-    if (!vendor) {
-      res.status(404).json({ error: 'Vendor not found' });
-      return;
-    }
+    const vendor = repo.updateVendor(req.params.id, req.body, req.user!.id);
+    if (!vendor) { res.status(404).json({ error: 'Vendor not found' }); return; }
     res.json(vendor);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch vendor' });
+  } catch (err: any) {
+    if (err.message?.includes('UNIQUE constraint')) {
+      res.status(409).json({ error: 'Vendor with this legal name already exists', field: 'legal_name' }); return;
+    }
+    throw err;
   }
 });
 
-// PATCH /api/vendors/:id
-router.patch('/vendors/:id', requireWriter, async (req: AuthRequest, res: Response) => {
+router.delete('/vendors/:id', requireAdmin, (req: Request, res: Response) => {
+  const vendor = repo.deleteVendor(req.params.id, req.user!.id);
+  if (!vendor) { res.status(404).json({ error: 'Vendor not found' }); return; }
+  res.json(vendor);
+});
+
+router.post('/vendors/:id/deactivate', requireWriter, (req: Request, res: Response) => {
+  const vendor = repo.deactivateVendor(req.params.id, req.user!.id);
+  if (!vendor) { res.status(404).json({ error: 'Vendor not found' }); return; }
+  res.json(vendor);
+});
+
+// ---- Contracts ----
+router.get('/contracts', (req: Request, res: Response) => {
+  const result = repo.listContracts({
+    search: qs(req.query.search),
+    status: qs(req.query.status),
+    vendor_id: qs(req.query.vendor_id),
+    owner: qs(req.query.owner),
+    risk_tier: qs(req.query.risk_tier),
+    expiry_window: req.query.expiry_window ? Number(req.query.expiry_window) : undefined,
+    archived: qs(req.query.archived),
+    sort: qs(req.query.sort),
+    order: qs(req.query.order),
+    page: Number(req.query.page) || 1,
+    limit: Number(req.query.limit) || 50,
+  });
+  res.json(result);
+});
+
+router.get('/contracts/export.csv', (req: Request, res: Response) => {
+  const result = repo.listContracts({ ...req.query as any, limit: 5000 });
+  const cols = ['id', 'title', 'vendor_id', 'contract_owner', 'status', 'start_date', 'end_date', 'contract_value', 'currency', 'risk_tier', 'auto_renew'];
+  const header = cols.join(',');
+  const rows = result.data.map(c => cols.map(col => {
+    const val = (c as any)[col];
+    if (val === null || val === undefined) return '';
+    const s = String(val);
+    return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s;
+  }).join(','));
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename="contracts.csv"');
+  res.send([header, ...rows].join('\r\n'));
+});
+
+router.get('/contracts/upload/spec', requireWriter, (_req: Request, res: Response) => {
+  res.json({ spec: getExtractionSpec(), providers: getConfiguredProviders() });
+});
+
+router.get('/contracts/:id', (req: Request, res: Response) => {
+  const contract = repo.getContract(req.params.id);
+  if (!contract) { res.status(404).json({ error: 'Contract not found' }); return; }
+  res.json(contract);
+});
+
+function validateContract(data: any, isUpdate = false): string[] {
+  const errors: string[] = [];
+  if (!isUpdate) {
+    if (!data.title?.trim()) errors.push('title is required');
+    if (!data.vendor_id) errors.push('vendor_id is required');
+    if (!data.contract_owner?.trim()) errors.push('contract_owner is required');
+    if (!data.start_date) errors.push('start_date is required');
+    if (!data.end_date) errors.push('end_date is required');
+  }
+  if (data.start_date && data.end_date && data.end_date <= data.start_date) {
+    errors.push('end_date must be after start_date');
+  }
+  if (data.contract_value !== undefined && data.contract_value !== null && data.contract_value < 0) {
+    errors.push('contract_value cannot be negative');
+  }
+  const validStatuses = ['Draft', 'Under Review', 'Active', 'Expiring Soon', 'Expired', 'Terminated', 'Archived'];
+  if (data.status && !validStatuses.includes(data.status)) {
+    errors.push('Invalid status');
+  }
+  if (data.vendor_id) {
+    const vendor = repo.getVendor(data.vendor_id);
+    if (!vendor) errors.push('vendor_id references non-existent vendor');
+  }
+  if (data.parent_contract_id) {
+    const parent = repo.getContract(data.parent_contract_id);
+    if (!parent) errors.push('parent_contract_id references non-existent contract');
+  }
+  return errors;
+}
+
+router.post('/contracts', requireWriter, (req: Request, res: Response) => {
+  const errors = validateContract(req.body);
+  if (errors.length) { res.status(400).json({ error: 'Validation failed', details: errors }); return; }
+  const contract = repo.createContract(req.body, req.user!.id);
+  res.status(201).json(contract);
+});
+
+router.patch('/contracts/:id', requireWriter, (req: Request, res: Response) => {
+  const existing = repo.getContract(req.params.id);
+  if (!existing) { res.status(404).json({ error: 'Contract not found' }); return; }
+  if (existing.archived && req.user!.role !== 'Admin') {
+    res.status(403).json({ error: 'Archived contracts cannot be edited except by Admin' }); return;
+  }
+  if (req.body.parent_contract_id === req.params.id) {
+    res.status(400).json({ error: 'Contract cannot reference itself as parent', details: ['Self-referencing parent_contract_id'] }); return;
+  }
+  const errors = validateContract(req.body, true);
+  if (errors.length) { res.status(400).json({ error: 'Validation failed', details: errors }); return; }
+  const contract = repo.updateContract(req.params.id, req.body, req.user!.id);
+  res.json(contract);
+});
+
+router.delete('/contracts/:id', requireWriter, (req: Request, res: Response) => {
+  const contract = repo.deleteContract(req.params.id, req.user!.id);
+  if (!contract) { res.status(404).json({ error: 'Contract not found' }); return; }
+  res.json(contract);
+});
+
+router.post('/contracts/:id/archive', requireWriter, (req: Request, res: Response) => {
+  const contract = repo.archiveContract(req.params.id, req.user!.id);
+  if (!contract) { res.status(404).json({ error: 'Contract not found' }); return; }
+  res.json(contract);
+});
+
+router.post('/contracts/:id/restore', requireAdmin, (req: Request, res: Response) => {
+  const contract = repo.restoreContract(req.params.id, req.user!.id);
+  if (!contract) { res.status(404).json({ error: 'Contract not found' }); return; }
+  res.json(contract);
+});
+
+// ---- Reminders ----
+router.get('/contracts/:id/reminders', (req: Request, res: Response) => {
+  const contract = repo.getContract(req.params.id);
+  if (!contract) { res.status(404).json({ error: 'Contract not found' }); return; }
+  res.json(repo.listReminders(req.params.id));
+});
+
+router.post('/contracts/:id/reminders', requireWriter, (req: Request, res: Response) => {
+  const contract = repo.getContract(req.params.id);
+  if (!contract) { res.status(404).json({ error: 'Contract not found' }); return; }
+  if (!req.body.reminder_date) { res.status(400).json({ error: 'reminder_date is required' }); return; }
+  if (!req.body.reminder_type) { res.status(400).json({ error: 'reminder_type is required' }); return; }
+  const reminder = repo.createReminder({ ...req.body, contract_id: req.params.id, owner_user_id: req.body.owner_user_id || req.user!.id }, req.user!.id);
+  res.status(201).json(reminder);
+});
+
+router.get('/reminders', (req: Request, res: Response) => {
+  res.json(repo.getAllReminders({ completed: qs(req.query.completed) }));
+});
+
+router.patch('/reminders/:id', requireWriter, (req: Request, res: Response) => {
+  const reminder = repo.updateReminder(req.params.id, req.body, req.user!.id);
+  if (!reminder) { res.status(404).json({ error: 'Reminder not found' }); return; }
+  res.json(reminder);
+});
+
+// ---- Dashboard ----
+router.get('/dashboard/summary', (_req: Request, res: Response) => {
+  res.json(repo.getDashboardSummary());
+});
+
+// ---- Activity Events ----
+router.get('/activity', (req: Request, res: Response) => {
+  const result = repo.listActivityEvents({
+    entity_type: qs(req.query.entity_type),
+    entity_id: qs(req.query.entity_id),
+    actor_user_id: qs(req.query.actor_user_id),
+    action: qs(req.query.action),
+    page: Number(req.query.page) || 1,
+    limit: Number(req.query.limit) || 50,
+  });
+  res.json(result);
+});
+
+// ---- Documents ----
+router.get('/contracts/:id/documents', (req: Request, res: Response) => {
+  res.json(repo.listDocuments(req.params.id));
+});
+
+// ---- OCR Upload ----
+router.post('/contracts/upload', requireWriter, upload.single('file'), async (req: Request, res: Response) => {
   try {
-    const vendor = await vendorRepo.findById(req.params.id as string);
+    if (!req.file) { res.status(400).json({ error: 'No file uploaded' }); return; }
+
+    const allowedTypes = ['image/png', 'image/jpeg', 'image/webp', 'application/pdf'];
+    if (!allowedTypes.includes(req.file.mimetype)) {
+      fs.unlinkSync(req.file.path);
+      res.status(400).json({ error: 'Unsupported file type. Allowed: PNG, JPEG, WebP, PDF' }); return;
+    }
+
+    const provider = req.body.provider || 'auto';
+    const { data: extracted, provider: usedProvider } = await extractContractData(req.file.path, req.file.mimetype, provider);
+
+    // Validate extracted contract data
+    const contractData = extracted.contract || {};
+    const vendorData = extracted.vendor || {};
+    const parentRef = extracted.parent_contract_reference;
+
+    const validationErrors: string[] = [];
+    if (!contractData.title?.trim()) validationErrors.push('title is required');
+    if (!contractData.contract_owner?.trim()) validationErrors.push('contract_owner is required');
+    if (!contractData.start_date) validationErrors.push('start_date is required');
+    if (!contractData.end_date) validationErrors.push('end_date is required');
+    if (!vendorData.legal_name?.trim()) validationErrors.push('vendor legal_name is required');
+
+    if (validationErrors.length) {
+      fs.unlinkSync(req.file.path);
+      res.status(422).json({ error: 'Extraction produced invalid data', details: validationErrors, extracted }); return;
+    }
+
+    // Resolve or create vendor
+    let vendor = getDb().prepare('SELECT * FROM vendors WHERE LOWER(TRIM(legal_name)) = LOWER(TRIM(?))').get(vendorData.legal_name) as any;
     if (!vendor) {
-      res.status(404).json({ error: 'Vendor not found' });
-      return;
+      vendor = repo.createVendor({ ...vendorData, status: 'Active' }, req.user!.id);
     }
 
-    const updated: Vendor = {
-      ...vendor,
-      ...req.body,
-      id: vendor.id,
-      created_at: vendor.created_at,
-      updated_at: new Date().toISOString()
-    };
-
-    const validation = validateVendor(updated);
-    if (!validation.isValid()) {
-      res.status(400).json(validation.toResponse());
-      return;
-    }
-
-    const duplicate = await vendorRepo.findByLegalNameNormalized(updated.legal_name);
-    if (duplicate && duplicate.id !== vendor.id) {
-      res.status(409).json({
-        error: {
-          field: 'legal_name',
-          message: 'A vendor with this legal name already exists'
+    // Resolve parent contract
+    let parentContractId = null;
+    const relationResults: any = {};
+    if (parentRef) {
+      const byId = repo.getContract(parentRef);
+      if (byId) { parentContractId = byId.id; relationResults.parent = { resolved: true, by: 'id' }; }
+      else {
+        const byRef = getDb().prepare('SELECT * FROM contracts WHERE external_reference_id = ?').get(parentRef) as any;
+        if (byRef) { parentContractId = byRef.id; relationResults.parent = { resolved: true, by: 'external_reference_id' }; }
+        else {
+          const byTitle = getDb().prepare('SELECT * FROM contracts WHERE title = ?').get(parentRef) as any;
+          if (byTitle) { parentContractId = byTitle.id; relationResults.parent = { resolved: true, by: 'title' }; }
+          else { relationResults.parent = { resolved: false, reference: parentRef }; }
         }
-      });
-      return;
-    }
-
-    await vendorRepo.update(updated);
-    await activityRepo.logActivity(req.user!.id, 'Vendor', vendor.id, 'Update', `Updated vendor: ${vendor.legal_name}`);
-    res.json(updated);
-  } catch (err) {
-    if ((err as Error).message.includes('UNIQUE constraint failed')) {
-      res.status(409).json({
-        error: {
-          field: 'legal_name',
-          message: 'A vendor with this legal name already exists'
-        }
-      });
-      return;
-    }
-    res.status(500).json({ error: 'Failed to update vendor' });
-  }
-});
-
-// DELETE /api/vendors/:id
-router.delete('/vendors/:id', requireAdmin, async (req: AuthRequest, res: Response) => {
-  try {
-    const vendor = await vendorRepo.findById(req.params.id as string);
-    if (!vendor) {
-      res.status(404).json({ error: 'Vendor not found' });
-      return;
-    }
-
-    const updated: Vendor = {
-      ...vendor,
-      status: 'Inactive',
-      updated_at: new Date().toISOString()
-    };
-
-    await vendorRepo.update(updated);
-    await activityRepo.logActivity(req.user!.id, 'Vendor', vendor.id, 'Update', `Soft-deleted vendor (set inactive): ${vendor.legal_name}`);
-    res.json(updated);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to delete vendor' });
-  }
-});
-
-// POST /api/vendors/:id/deactivate
-router.post('/vendors/:id/deactivate', requireWriter, async (req: AuthRequest, res: Response) => {
-  try {
-    const vendor = await vendorRepo.findById(req.params.id as string);
-    if (!vendor) {
-      res.status(404).json({ error: 'Vendor not found' });
-      return;
-    }
-
-    if (vendor.status === 'Inactive') {
-      res.status(200).json(vendor);
-      return;
-    }
-
-    const updated: Vendor = {
-      ...vendor,
-      status: 'Inactive',
-      updated_at: new Date().toISOString()
-    };
-
-    await vendorRepo.update(updated);
-    await activityRepo.logActivity(req.user!.id, 'Vendor', vendor.id, 'Update', `Deactivated vendor: ${vendor.legal_name}`);
-    res.json(updated);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to deactivate vendor' });
-  }
-});
-
-// ===== CONTRACT ENDPOINTS =====
-
-// GET /api/contracts - List contracts with filters
-router.get('/contracts', async (req: AuthRequest, res: Response) => {
-  try {
-    let contracts: Contract[] = [];
-    
-    const limit = Math.min(parseInt(req.query.limit as string) || 100, 1000);
-    const offset = parseInt(req.query.offset as string) || 0;
-    const search = req.query.search as string;
-    const status = req.query.status as string;
-    const vendorId = req.query.vendor_id as string;
-
-    if (search) {
-      contracts = await contractRepo.searchByTitle(search);
-    } else {
-      contracts = await contractRepo.findAll(limit, offset);
-    }
-
-    // Apply filters
-    if (status) {
-      contracts = contracts.filter(c => c.status === status);
-    }
-    if (vendorId) {
-      contracts = contracts.filter(c => c.vendor_id === vendorId);
-    }
-
-    contracts = contracts.filter(c => !c.archived);
-
-    res.json({ data: contracts, count: contracts.length });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch contracts' });
-  }
-});
-
-// POST /api/contracts - Create contract
-router.post('/contracts', requireWriter, async (req: AuthRequest, res: Response) => {
-  try {
-    const validation = validateContract(req.body);
-    if (!validation.isValid()) {
-      res.status(400).json(validation.toResponse());
-      return;
-    }
-
-    // Verify vendor exists
-    const vendor = await vendorRepo.findById(req.body.vendor_id);
-    if (!vendor) {
-      res.status(400).json({ error: { field: 'vendor_id', message: 'Vendor not found' } });
-      return;
-    }
-
-    if (req.body.parent_contract_id) {
-      const parentContract = await contractRepo.findById(req.body.parent_contract_id);
-      if (!parentContract) {
-        res.status(400).json({ error: { field: 'parent_contract_id', message: 'Parent contract not found' } });
-        return;
       }
     }
 
-    const now = new Date().toISOString();
-    const contract: Contract = {
-      id: randomUUID(),
-      title: req.body.title,
-      vendor_id: req.body.vendor_id,
-      contract_owner: req.body.contract_owner,
-      start_date: req.body.start_date,
-      end_date: req.body.end_date,
-      status: req.body.status || 'Draft',
-      external_reference_id: req.body.external_reference_id,
-      contract_type: req.body.contract_type,
-      description: req.body.description,
-      parent_contract_id: req.body.parent_contract_id,
-      effective_date: req.body.effective_date,
-      signature_date: req.body.signature_date,
-      initial_term_months: req.body.initial_term_months,
-      auto_renew: req.body.auto_renew ?? false,
-      renewal_term_months: req.body.renewal_term_months,
-      notice_period_days: req.body.notice_period_days,
-      termination_date: req.body.termination_date,
-      contract_value: req.body.contract_value,
-      currency: req.body.currency,
-      billing_frequency: req.body.billing_frequency,
-      payment_terms: req.body.payment_terms,
-      cost_center_code: req.body.cost_center_code,
-      spend_category: req.body.spend_category,
-      price_escalation_terms: req.body.price_escalation_terms,
-      risk_tier: req.body.risk_tier,
-      data_classification: req.body.data_classification,
-      insurance_required: req.body.insurance_required ?? false,
-      soc2_required: req.body.soc2_required ?? false,
-      dpa_required: req.body.dpa_required ?? false,
-      compliance_exceptions: req.body.compliance_exceptions,
-      regulatory_tags: req.body.regulatory_tags,
-      key_obligations: req.body.key_obligations,
-      sla_terms: req.body.sla_terms,
-      service_credits_terms: req.body.service_credits_terms,
-      audit_rights_flag: req.body.audit_rights_flag ?? false,
-      notes: req.body.notes,
-      archived: false,
-      created_at: now,
-      created_by: req.user!.id,
-      updated_at: now,
-      updated_by: req.user!.id
-    };
+    // Create contract
+    const contract = repo.createContract({
+      ...contractData,
+      vendor_id: vendor.id,
+      parent_contract_id: parentContractId,
+    }, req.user!.id);
 
-    const created = await contractRepo.create(contract);
-    await activityRepo.logActivity(req.user!.id, 'Contract', contract.id, 'Create', `Created contract: ${contract.title}`);
-    res.status(201).json(created);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to create contract' });
-  }
-});
-
-// GET /api/contracts/:id
-router.get('/contracts/:id', async (req: AuthRequest, res: Response) => {
-  try {
-    const contract = await contractRepo.findById(req.params.id as string);
-    if (!contract) {
-      res.status(404).json({ error: 'Contract not found' });
-      return;
-    }
-    res.json(contract);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch contract' });
-  }
-});
-
-// PATCH /api/contracts/:id
-router.patch('/contracts/:id', requireWriter, async (req: AuthRequest, res: Response) => {
-  try {
-    const contract = await contractRepo.findById(req.params.id as string);
-    if (!contract) {
-      res.status(404).json({ error: 'Contract not found' });
-      return;
-    }
-
-    if (contract.archived && req.user?.role !== 'Admin') {
-      res.status(403).json({ error: 'Cannot edit archived contracts' });
-      return;
-    }
-
-    const updated: Contract = {
-      ...contract,
-      ...req.body,
-      id: contract.id,
-      created_at: contract.created_at,
-      created_by: contract.created_by,
-      updated_at: new Date().toISOString(),
-      updated_by: req.user!.id
-    };
-
-    const validation = validateContract(updated);
-    if (!validation.isValid()) {
-      res.status(400).json(validation.toResponse());
-      return;
-    }
-
-    const vendor = await vendorRepo.findById(updated.vendor_id);
-    if (!vendor) {
-      res.status(400).json({ error: { field: 'vendor_id', message: 'Vendor not found' } });
-      return;
-    }
-
-    if (updated.parent_contract_id) {
-      if (updated.parent_contract_id === contract.id) {
-        res.status(400).json({ error: { field: 'parent_contract_id', message: 'Contract cannot reference itself as parent' } });
-        return;
-      }
-
-      const parentContract = await contractRepo.findById(updated.parent_contract_id);
-      if (!parentContract) {
-        res.status(400).json({ error: { field: 'parent_contract_id', message: 'Parent contract not found' } });
-        return;
-      }
-    }
-
-    await contractRepo.update(updated);
-    await activityRepo.logActivity(req.user!.id, 'Contract', contract.id, 'Update', `Updated contract: ${contract.title}`);
-    res.json(updated);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to update contract' });
-  }
-});
-
-// DELETE /api/contracts/:id (soft-delete via archive)
-router.delete('/contracts/:id', requireWriter, async (req: AuthRequest, res: Response) => {
-  try {
-    const contract = await contractRepo.findById(req.params.id as string);
-    if (!contract) {
-      res.status(404).json({ error: 'Contract not found' });
-      return;
-    }
-
-    const now = new Date().toISOString();
-    const archived: Contract = {
-      ...contract,
-      archived: true,
-      status: 'Archived',
-      archived_at: now,
-      archived_by: req.user!.id,
-      updated_at: now,
-      updated_by: req.user!.id
-    };
-
-    await contractRepo.update(archived);
-    await activityRepo.logActivity(req.user!.id, 'Contract', contract.id, 'Archive', `Deleted (archived) contract: ${contract.title}`);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to delete contract' });
-  }
-});
-
-// POST /api/contracts/:id/archive - Archive contract
-router.post('/contracts/:id/archive', requireWriter, async (req: AuthRequest, res: Response) => {
-  try {
-    const contract = await contractRepo.findById(req.params.id as string);
-    if (!contract) {
-      res.status(404).json({ error: 'Contract not found' });
-      return;
-    }
-
-    const now = new Date().toISOString();
-    const archived = {
-      ...contract,
-      archived: true,
-      archived_at: now,
-      archived_by: req.user!.id,
-      updated_at: now,
-      updated_by: req.user!.id
-    };
-
-    await contractRepo.update(archived);
-    await activityRepo.logActivity(req.user!.id, 'Contract', contract.id, 'Archive', `Archived contract: ${contract.title}`);
-    res.json(archived);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to archive contract' });
-  }
-});
-
-// POST /api/contracts/:id/restore - Restore archived contract (Admin only)
-router.post('/contracts/:id/restore', requireAdmin, async (req: AuthRequest, res: Response) => {
-  try {
-    const contract = await contractRepo.findById(req.params.id as string);
-    if (!contract) {
-      res.status(404).json({ error: 'Contract not found' });
-      return;
-    }
-
-    if (!contract.archived) {
-      res.status(400).json({ error: 'Contract is not archived' });
-      return;
-    }
-
-    const now = new Date().toISOString();
-    const restored = {
-      ...contract,
-      archived: false,
-      archived_at: undefined,
-      archived_by: undefined,
-      updated_at: now,
-      updated_by: req.user!.id
-    };
-
-    await contractRepo.update(restored);
-    await activityRepo.logActivity(req.user!.id, 'Contract', contract.id, 'Restore', `Restored contract: ${contract.title}`);
-    res.json(restored);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to restore contract' });
-  }
-});
-
-// ===== REMINDER ENDPOINTS =====
-
-// GET /api/contracts/:contractId/reminders
-router.get('/contracts/:contractId/reminders', async (req: AuthRequest, res: Response) => {
-  try {
-    const reminders = await reminderRepo.findByContract(req.params.contractId as string);
-    res.json({ data: reminders });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch reminders' });
-  }
-});
-
-// POST /api/contracts/:contractId/reminders
-router.post('/contracts/:contractId/reminders', requireWriter, async (req: AuthRequest, res: Response) => {
-  try {
-    const validation = validateReminder({ ...req.body, contract_id: req.params.contractId as string });
-    if (!validation.isValid()) {
-      res.status(400).json(validation.toResponse());
-      return;
-    }
-
-    const now = new Date().toISOString();
-    const reminder: Reminder = {
-      id: randomUUID(),
-      contract_id: req.params.contractId as string,
-      reminder_date: req.body.reminder_date,
-      reminder_type: req.body.reminder_type,
-      owner_user_id: req.body.owner_user_id || req.user!.id,
-      completed: false,
-      reminder_note: req.body.reminder_note,
-      created_at: now,
-      updated_at: now
-    };
-
-    const created = await reminderRepo.create(reminder);
-    await activityRepo.logActivity(req.user!.id, 'Reminder', reminder.id, 'Create', `Created reminder for contract`);
-    res.status(201).json(created);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to create reminder' });
-  }
-});
-
-// PATCH /api/reminders/:id
-router.patch('/reminders/:id', requireWriter, async (req: AuthRequest, res: Response) => {
-  try {
-    const reminder = await reminderRepo.findById(req.params.id as string);
-    if (!reminder) {
-      res.status(404).json({ error: 'Reminder not found' });
-      return;
-    }
-
-    const now = new Date().toISOString();
-    const updated: Reminder = {
-      ...reminder,
-      ...req.body,
-      id: reminder.id,
-      created_at: reminder.created_at,
-      updated_at: now,
-      completion_timestamp: req.body.completed && !reminder.completed ? now : reminder.completion_timestamp
-    };
-
-    await reminderRepo.update(updated);
-    await activityRepo.logActivity(req.user!.id, 'Reminder', reminder.id, 'Update', `Updated reminder`);
-    res.json(updated);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to update reminder' });
-  }
-});
-
-// ===== DASHBOARD ENDPOINTS =====
-
-// GET /api/dashboard/summary
-router.get('/dashboard/summary', async (req: AuthRequest, res: Response) => {
-  try {
-    const allContracts = await contractRepo.findAll(10000, 0);
-    const activeContracts = allContracts.filter(c => c.status === 'Active' && !c.archived);
-    
-    const expiring30 = await contractRepo.findExpiringContracts(30);
-    const expiring60 = await contractRepo.findExpiringContracts(60);
-    const expiring90 = await contractRepo.findExpiringContracts(90);
-    const expired = await contractRepo.findExpiredContracts();
-
-    const allVendors = await vendorRepo.findAll(10000, 0);
-    const highRiskVendors = allVendors.filter(v => v.risk_tier === 'High');
-    const highRiskContracts = activeContracts.filter(c => c.risk_tier === 'High');
-
-    const statusSummary: any = {};
-    allContracts.forEach(c => {
-      statusSummary[c.status] = (statusSummary[c.status] || 0) + 1;
+    // Save file and create document metadata
+    const storagePath = saveUploadedFile(req.file, contract.id);
+    const checksum = computeChecksum(storagePath);
+    const doc = repo.createDocumentMetadata({
+      contract_id: contract.id,
+      file_name: req.file.originalname,
+      file_type: req.file.mimetype,
+      storage_pointer: storagePath,
+      uploaded_by: req.user!.id,
+      checksum,
+      file_size: req.file.size,
+      source_system: 'ocr-upload',
     });
 
-    res.json({
-      total_active_contracts: activeContracts.length,
-      expiring_30_days: expiring30.length,
-      expiring_60_days: expiring60.length,
-      expiring_90_days: expiring90.length,
-      expired_contracts: expired.length,
-      high_risk_vendors: highRiskVendors.length,
-      high_risk_contracts: highRiskContracts.length,
-      status_summary: statusSummary
-    });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch dashboard summary' });
-  }
-});
-
-// ===== EXPORT ENDPOINTS =====
-
-// GET /api/contracts/export.csv
-router.get('/contracts/export.csv', async (req: AuthRequest, res: Response) => {
-  try {
-    const contracts = await contractRepo.findAll(10000, 0);
-    
-    const headers = ['id', 'title', 'vendor_id', 'contract_owner', 'status', 'start_date', 'end_date', 'contract_value', 'currency', 'risk_tier', 'auto_renew'];
-    
-    const csv = [
-      headers.join(','),
-      ...contracts
-        .filter(c => !c.archived)
-        .map(c => 
-          [
-            c.id,
-            `"${c.title}"`,
-            c.vendor_id,
-            c.contract_owner,
-            c.status,
-            c.start_date,
-            c.end_date,
-            c.contract_value || '',
-            c.currency || '',
-            c.risk_tier || '',
-            c.auto_renew ? '1' : '0'
-          ].join(',')
-        )
-    ].join('\n');
-
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', 'attachment; filename="contracts.csv"');
-    res.send(csv);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to export contracts' });
+    res.status(201).json({ contract, vendor, document: doc, extracted, provider: usedProvider, relationResults });
+  } catch (err: any) {
+    if (req.file?.path) try { fs.unlinkSync(req.file.path); } catch {}
+    res.status(500).json({ error: err.message });
   }
 });
 

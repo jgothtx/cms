@@ -1,143 +1,86 @@
 import { Request, Response, NextFunction } from 'express';
-import { UserRole } from './models';
-import { database } from './database';
+import jwt from 'jsonwebtoken';
+import { findUserBySubject, createUser } from './repositories';
+import type { AuthUser } from './models';
 
-// Mock JWT verification - in production, would validate Okta tokens
-export interface AuthRequest extends Request {
-  user?: {
-    id: string;
-    email: string;
-    role: UserRole;
-    authSubjectId: string;
-  };
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-production';
+
+declare global {
+  namespace Express {
+    interface Request {
+      user?: AuthUser;
+    }
+  }
 }
 
-// JWT token structure
-interface DecodedToken {
-  sub: string; // auth subject id
-  email: string;
-  role: UserRole;
-  iat: number;
-  exp: number;
+export function generateToken(payload: { sub: string; name: string; email: string; role: string }): string {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: '24h' });
 }
 
-// Mock JWT parser - expects Authorization: Bearer <token> header
-// In production, would validate against Okta tenant
-export function extractBearerToken(req: AuthRequest): string | null {
+export function authenticate(req: Request, res: Response, next: NextFunction): void {
   const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return null;
+
+  // Dev mode: allow X-User-Role header for testing
+  if (!authHeader && process.env.NODE_ENV !== 'production') {
+    const role = (req.headers['x-user-role'] as string) || 'Admin';
+    const userId = (req.headers['x-user-id'] as string) || 'dev-user';
+    req.user = { id: userId, role: role as AuthUser['role'], display_name: 'Dev User', email: 'dev@example.com' };
+    return next();
   }
-  return authHeader.substring(7);
-}
 
-// Mock token decoder - for MVP, assumes token is JSON-encoded
-// Production: validate signature with Okta public key
-export function decodeToken(token: string): DecodedToken | null {
-  try {
-    const buffer = Buffer.from(token, 'base64');
-    const decoded = JSON.parse(buffer.toString());
-    return decoded;
-  } catch {
-    return null;
+  if (!authHeader?.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'Missing or invalid authorization header' });
+    return;
   }
-}
 
-// Middleware to attach user info to request
-export async function authMiddleware(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
   try {
-    const token = extractBearerToken(req);
-    
-    if (!token) {
-      res.status(401).json({ error: 'Missing authorization token' });
-      return;
+    const token = authHeader.substring(7);
+    const decoded = jwt.verify(token, JWT_SECRET) as any;
+
+    // Auto-provision user
+    let user = findUserBySubject(decoded.sub);
+    if (!user) {
+      user = createUser({
+        auth_subject_id: decoded.sub,
+        display_name: decoded.name || decoded.email || 'Unknown',
+        email: decoded.email || '',
+        role: decoded.role || 'Viewer',
+      });
     }
 
-    const decoded = decodeToken(token);
-    if (!decoded) {
-      res.status(401).json({ error: 'Invalid token' });
-      return;
-    }
-
-    // Ensure authenticated principals exist in users for FK-safe audit logging.
-    const now = new Date().toISOString();
-    const existing = await database.get(
-      'SELECT id FROM users WHERE auth_subject_id = ? OR email = ? LIMIT 1',
-      [decoded.sub, decoded.email]
-    );
-
-    const userId = existing?.id || decoded.sub;
-
-    if (!existing) {
-      await database.run(
-        `INSERT INTO users (id, email, display_name, role, auth_subject_id, active, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 1, ?, ?)`,
-        [userId, decoded.email, decoded.email, decoded.role, decoded.sub, now, now]
-      );
-    } else {
-      await database.run(
-        `UPDATE users
-         SET email = ?, role = ?, auth_subject_id = ?, updated_at = ?
-         WHERE id = ?`,
-        [decoded.email, decoded.role, decoded.sub, now, userId]
-      );
-    }
-
-    // Attach user to request
-    req.user = {
-      id: userId,
-      email: decoded.email,
-      role: decoded.role,
-      authSubjectId: decoded.sub
-    };
-
+    req.user = { id: user.id, role: user.role, display_name: user.display_name, email: user.email };
     next();
-  } catch (err) {
-    res.status(401).json({ error: 'Authentication failed' });
+  } catch {
+    res.status(401).json({ error: 'Invalid or expired token' });
   }
 }
 
-// Authorization checks
-export function requireRole(...allowedRoles: UserRole[]) {
-  return (req: AuthRequest, res: Response, next: NextFunction) => {
+export function requireRole(...roles: string[]) {
+  return (req: Request, res: Response, next: NextFunction): void => {
     if (!req.user) {
       res.status(401).json({ error: 'Not authenticated' });
       return;
     }
-
-    if (!allowedRoles.includes(req.user.role)) {
-      res.status(403).json({ error: 'Insufficient permissions for this action' });
+    if (!roles.includes(req.user.role)) {
+      res.status(403).json({ error: 'Insufficient permissions' });
       return;
     }
-
     next();
   };
 }
 
-export function requireAdmin(req: AuthRequest, res: Response, next: NextFunction): void {
-  if (!req.user) {
-    res.status(401).json({ error: 'Not authenticated' });
+export function requireWriter(req: Request, res: Response, next: NextFunction): void {
+  if (!req.user || req.user.role === 'Viewer') {
+    res.status(403).json({ error: 'Insufficient permissions' });
     return;
   }
-
-  if (req.user.role !== 'Admin') {
-    res.status(403).json({ error: 'Admin access required' });
-    return;
-  }
-
   next();
 }
 
-export function requireWriter(req: AuthRequest, res: Response, next: NextFunction): void {
-  if (!req.user) {
-    res.status(401).json({ error: 'Not authenticated' });
+export function requireAdmin(req: Request, res: Response, next: NextFunction): void {
+  if (!req.user || req.user.role !== 'Admin') {
+    res.status(403).json({ error: 'Admin access required' });
     return;
   }
-
-  if (!['Admin', 'Contract Manager'].includes(req.user.role)) {
-    res.status(403).json({ error: 'Write access required' });
-    return;
-  }
-
   next();
 }

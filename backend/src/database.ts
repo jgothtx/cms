@@ -1,232 +1,167 @@
-import sqlite3 from 'sqlite3';
+import Database from 'better-sqlite3';
 import path from 'path';
 
-const DB_PATH = process.env.CONTRACT_DB_PATH || path.join(__dirname, '..', '..', 'contracts.db');
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'contracts.db');
 
-export class Database {
-  private db: sqlite3.Database;
-  private isTest = process.env.NODE_ENV === 'test' || !!process.env.JEST_WORKER_ID;
+let db: Database.Database;
 
-  constructor() {
-    this.db = new sqlite3.Database(DB_PATH, (err) => {
-      if (err) {
-        if (!this.isTest) {
-          console.error('Error opening database:', err);
-        }
-      } else if (!this.isTest) {
-        console.log('Connected to SQLite database');
-      }
-    });
-    this.db.run('PRAGMA foreign_keys = ON');
+export function getDb(): Database.Database {
+  if (!db) {
+    db = new Database(DB_PATH);
+    db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = ON');
+    initSchema(db);
+    deduplicateVendors(db);
   }
+  return db;
+}
 
-  async initialize(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.db.serialize(() => {
-        // Users table
-        this.db.run(`
-          CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY,
-            email TEXT UNIQUE NOT NULL,
-            display_name TEXT NOT NULL,
-            role TEXT NOT NULL CHECK(role IN ('Admin', 'Contract Manager', 'Viewer')),
-            auth_subject_id TEXT UNIQUE,
-            department TEXT,
-            title TEXT,
-            active BOOLEAN DEFAULT 1,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-          )
-        `);
+function initSchema(db: Database.Database) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      display_name TEXT NOT NULL,
+      email TEXT NOT NULL,
+      role TEXT NOT NULL CHECK(role IN ('Admin','Contract Manager','Viewer')),
+      auth_subject_id TEXT NOT NULL UNIQUE,
+      department TEXT,
+      title TEXT,
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
 
-        // Vendors table
-        this.db.run(`
-          CREATE TABLE IF NOT EXISTS vendors (
-            id TEXT PRIMARY KEY,
-            legal_name TEXT NOT NULL,
-            dba_name TEXT,
-            category TEXT,
-            status TEXT NOT NULL CHECK(status IN ('Active', 'Inactive')),
-            risk_tier TEXT NOT NULL CHECK(risk_tier IN ('Low', 'Medium', 'High')),
-            tax_id TEXT,
-            website TEXT,
-            primary_contact_name TEXT,
-            primary_contact_email TEXT,
-            primary_contact_phone TEXT,
-            billing_contact_name TEXT,
-            billing_contact_email TEXT,
-            billing_address TEXT,
-            country TEXT,
-            performance_rating TEXT,
-            notes TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-          )
-        `);
+    CREATE TABLE IF NOT EXISTS vendors (
+      id TEXT PRIMARY KEY,
+      legal_name TEXT NOT NULL,
+      dba_name TEXT,
+      status TEXT NOT NULL DEFAULT 'Active' CHECK(status IN ('Active','Inactive')),
+      category TEXT,
+      tax_id TEXT,
+      website TEXT,
+      primary_contact_name TEXT,
+      primary_contact_email TEXT,
+      primary_contact_phone TEXT,
+      billing_contact_name TEXT,
+      billing_contact_email TEXT,
+      billing_address TEXT,
+      country TEXT,
+      risk_tier TEXT NOT NULL DEFAULT 'Low' CHECK(risk_tier IN ('Low','Medium','High')),
+      performance_rating TEXT,
+      notes TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
 
-        this.db.run(`
-          DELETE FROM vendors
-          WHERE rowid NOT IN (
-            SELECT MIN(rowid)
-            FROM vendors
-            GROUP BY lower(trim(legal_name))
-          )
-        `);
+    CREATE TABLE IF NOT EXISTS contracts (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      vendor_id TEXT NOT NULL REFERENCES vendors(id),
+      contract_owner TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'Draft' CHECK(status IN ('Draft','Under Review','Active','Expiring Soon','Expired','Terminated','Archived')),
+      start_date TEXT NOT NULL,
+      end_date TEXT NOT NULL,
+      external_reference_id TEXT,
+      contract_type TEXT,
+      description TEXT,
+      parent_contract_id TEXT REFERENCES contracts(id),
+      effective_date TEXT,
+      signature_date TEXT,
+      termination_date TEXT,
+      initial_term_months INTEGER,
+      renewal_term_months INTEGER,
+      auto_renew INTEGER DEFAULT 0,
+      notice_period_days INTEGER,
+      contract_value REAL,
+      currency TEXT DEFAULT 'USD',
+      billing_frequency TEXT CHECK(billing_frequency IS NULL OR billing_frequency IN ('Monthly','Quarterly','Semi-Annual','Annual','One-Time','Usage-Based')),
+      payment_terms TEXT,
+      cost_center_code TEXT,
+      spend_category TEXT,
+      price_escalation_terms TEXT,
+      risk_tier TEXT DEFAULT 'Low' CHECK(risk_tier IS NULL OR risk_tier IN ('Low','Medium','High')),
+      data_classification TEXT CHECK(data_classification IS NULL OR data_classification IN ('Public','Internal','Confidential','Restricted')),
+      insurance_required INTEGER DEFAULT 0,
+      soc2_required INTEGER DEFAULT 0,
+      dpa_required INTEGER DEFAULT 0,
+      compliance_exceptions TEXT,
+      regulatory_tags TEXT,
+      key_obligations TEXT,
+      sla_terms TEXT,
+      service_credits_terms TEXT,
+      audit_rights INTEGER DEFAULT 0,
+      notes TEXT,
+      archived INTEGER NOT NULL DEFAULT 0,
+      archived_at TEXT,
+      archived_by TEXT,
+      created_by TEXT,
+      updated_by TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
 
-        this.db.run(`
-          CREATE UNIQUE INDEX IF NOT EXISTS idx_vendors_legal_name_unique
-          ON vendors (lower(trim(legal_name)))
-        `);
+    CREATE TABLE IF NOT EXISTS reminders (
+      id TEXT PRIMARY KEY,
+      contract_id TEXT NOT NULL REFERENCES contracts(id),
+      reminder_date TEXT NOT NULL,
+      reminder_type TEXT NOT NULL,
+      owner_user_id TEXT NOT NULL,
+      completed INTEGER NOT NULL DEFAULT 0,
+      completed_at TEXT,
+      reminder_note TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
 
-        // Contracts table
-        this.db.run(`
-          CREATE TABLE IF NOT EXISTS contracts (
-            id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            vendor_id TEXT NOT NULL,
-            contract_owner TEXT NOT NULL,
-            start_date TEXT NOT NULL,
-            end_date TEXT NOT NULL,
-            status TEXT NOT NULL CHECK(status IN ('Draft', 'Under Review', 'Active', 'Expiring Soon', 'Expired', 'Terminated', 'Archived')),
-            external_reference_id TEXT,
-            contract_type TEXT,
-            description TEXT,
-            parent_contract_id TEXT,
-            effective_date TEXT,
-            signature_date TEXT,
-            initial_term_months INTEGER,
-            auto_renew BOOLEAN DEFAULT 0,
-            renewal_term_months INTEGER,
-            notice_period_days INTEGER,
-            termination_date TEXT,
-            contract_value REAL,
-            currency TEXT,
-            billing_frequency TEXT,
-            payment_terms TEXT,
-            cost_center_code TEXT,
-            spend_category TEXT,
-            price_escalation_terms TEXT,
-            risk_tier TEXT CHECK(risk_tier IN ('Low', 'Medium', 'High')),
-            data_classification TEXT,
-            insurance_required BOOLEAN DEFAULT 0,
-            soc2_required BOOLEAN DEFAULT 0,
-            dpa_required BOOLEAN DEFAULT 0,
-            compliance_exceptions TEXT,
-            regulatory_tags TEXT,
-            key_obligations TEXT,
-            sla_terms TEXT,
-            service_credits_terms TEXT,
-            audit_rights_flag BOOLEAN DEFAULT 0,
-            notes TEXT,
-            archived BOOLEAN DEFAULT 0,
-            archived_at TEXT,
-            archived_by TEXT,
-            created_at TEXT NOT NULL,
-            created_by TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            updated_by TEXT NOT NULL,
-            FOREIGN KEY(vendor_id) REFERENCES vendors(id),
-            FOREIGN KEY(parent_contract_id) REFERENCES contracts(id)
-          )
-        `);
+    CREATE TABLE IF NOT EXISTS activity_events (
+      id TEXT PRIMARY KEY,
+      timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+      actor_user_id TEXT,
+      entity_type TEXT NOT NULL CHECK(entity_type IN ('Contract','Vendor','Reminder','User')),
+      entity_id TEXT NOT NULL,
+      action TEXT NOT NULL CHECK(action IN ('Create','Update','StatusChange','Archive','Restore','Delete','Deactivate')),
+      change_summary TEXT,
+      before_snapshot TEXT,
+      after_snapshot TEXT,
+      correlation_id TEXT
+    );
 
-        // Reminders table
-        this.db.run(`
-          CREATE TABLE IF NOT EXISTS reminders (
-            id TEXT PRIMARY KEY,
-            contract_id TEXT NOT NULL,
-            reminder_date TEXT NOT NULL,
-            reminder_type TEXT NOT NULL,
-            owner_user_id TEXT NOT NULL,
-            completed BOOLEAN DEFAULT 0,
-            completion_timestamp TEXT,
-            reminder_note TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            FOREIGN KEY(contract_id) REFERENCES contracts(id),
-            FOREIGN KEY(owner_user_id) REFERENCES users(id)
-          )
-        `);
+    CREATE TABLE IF NOT EXISTS document_metadata (
+      id TEXT PRIMARY KEY,
+      contract_id TEXT NOT NULL REFERENCES contracts(id),
+      file_name TEXT NOT NULL,
+      file_type TEXT NOT NULL,
+      storage_pointer TEXT NOT NULL,
+      uploaded_by TEXT,
+      uploaded_at TEXT NOT NULL DEFAULT (datetime('now')),
+      version_number INTEGER NOT NULL DEFAULT 1,
+      document_category TEXT,
+      checksum TEXT,
+      file_size INTEGER,
+      source_system TEXT
+    );
+  `);
 
-        // ActivityEvent table
-        this.db.run(`
-          CREATE TABLE IF NOT EXISTS activity_events (
-            id TEXT PRIMARY KEY,
-            timestamp TEXT NOT NULL,
-            actor_user_id TEXT NOT NULL,
-            entity_type TEXT NOT NULL,
-            entity_id TEXT NOT NULL,
-            action TEXT NOT NULL CHECK(action IN ('Create', 'Update', 'StatusChange', 'Archive', 'Restore')),
-            change_summary TEXT NOT NULL,
-            before_snapshot TEXT,
-            after_snapshot TEXT,
-            correlation_id TEXT,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(actor_user_id) REFERENCES users(id)
-          )
-        `);
-
-        // DocumentMetadata table
-        this.db.run(`
-          CREATE TABLE IF NOT EXISTS document_metadata (
-            id TEXT PRIMARY KEY,
-            contract_id TEXT NOT NULL,
-            file_name TEXT NOT NULL,
-            file_type TEXT NOT NULL,
-            storage_pointer TEXT NOT NULL,
-            uploaded_by TEXT NOT NULL,
-            uploaded_at TEXT NOT NULL,
-            version_number INTEGER DEFAULT 1,
-            document_category TEXT,
-            checksum TEXT,
-            file_size INTEGER,
-            source_system TEXT,
-            FOREIGN KEY(contract_id) REFERENCES contracts(id),
-            FOREIGN KEY(uploaded_by) REFERENCES users(id)
-          )
-        `, (err) => {
-          if (err) reject(err);
-          else resolve();
-        });
-      });
-    });
-  }
-
-  run(sql: string, params: any[] = []): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.db.run(sql, params, (err) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-  }
-
-  get(sql: string, params: any[] = []): Promise<any> {
-    return new Promise((resolve, reject) => {
-      this.db.get(sql, params, (err, row) => {
-        if (err) reject(err);
-        else resolve(row);
-      });
-    });
-  }
-
-  all(sql: string, params: any[] = []): Promise<any[]> {
-    return new Promise((resolve, reject) => {
-      this.db.all(sql, params, (err, rows) => {
-        if (err) reject(err);
-        else resolve(rows || []);
-      });
-    });
-  }
-
-  close(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.db.close((err) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
+  // Create unique index on vendor legal_name if not exists
+  try {
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_vendor_legal_name_unique ON vendors(LOWER(TRIM(legal_name)));`);
+  } catch {
+    // Index may already exist
   }
 }
 
-export const database = new Database();
+function deduplicateVendors(db: Database.Database) {
+  const dupes = db.prepare(`
+    SELECT LOWER(TRIM(legal_name)) as norm_name, MIN(created_at) as earliest
+    FROM vendors
+    GROUP BY LOWER(TRIM(legal_name))
+    HAVING COUNT(*) > 1
+  `).all() as Array<{ norm_name: string; earliest: string }>;
+
+  for (const dupe of dupes) {
+    db.prepare(`
+      DELETE FROM vendors
+      WHERE LOWER(TRIM(legal_name)) = ? AND created_at != ?
+    `).run(dupe.norm_name, dupe.earliest);
+  }
+}

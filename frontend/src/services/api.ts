@@ -1,136 +1,73 @@
-import axios, { AxiosInstance } from 'axios';
-import { Contract, Vendor, Reminder } from '../../../backend/src/models';
+import axios from 'axios';
 
-export class ApiClient {
-  private client: AxiosInstance;
-  private token: string | null = null;
+const api = axios.create({
+  baseURL: import.meta.env.VITE_API_URL || '/api',
+});
 
-  constructor(baseURL: string = '/api', token?: string) {
-    this.client = axios.create({
-      baseURL,
-      headers: {
-        'Content-Type': 'application/json'
-      }
-    });
-
-    if (token) {
-      this.setToken(token);
-    }
-
-    // Add token to all requests if set
-    this.client.interceptors.request.use(config => {
-      if (this.token) {
-        config.headers.Authorization = `Bearer ${this.token}`;
-      }
-      return config;
-    });
+// Request interceptor for auth
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem('token');
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  } else {
+    // Dev mode: send role header
+    const role = localStorage.getItem('devRole') || 'Admin';
+    config.headers['X-User-Role'] = role;
+    config.headers['X-User-Id'] = 'dev-user';
   }
+  return config;
+});
 
-  setToken(token: string): void {
-    this.token = token;
-  }
+export default api;
 
-  // Health
-  async getHealth(): Promise<any> {
-    const { data } = await this.client.get('/health');
-    return data;
-  }
+// ---- Vendors ----
+export const vendorApi = {
+  list: (params?: any) => api.get('/vendors', { params }),
+  get: (id: string) => api.get(`/vendors/${id}`),
+  create: (data: any) => api.post('/vendors', data),
+  update: (id: string, data: any) => api.patch(`/vendors/${id}`, data),
+  delete: (id: string) => api.delete(`/vendors/${id}`),
+  deactivate: (id: string) => api.post(`/vendors/${id}/deactivate`),
+};
 
-  // Vendors
-  async getVendors(limit = 100, offset = 0): Promise<any> {
-    const { data } = await this.client.get('/vendors', { params: { limit, offset } });
-    return data;
-  }
+// ---- Contracts ----
+export const contractApi = {
+  list: (params?: any) => api.get('/contracts', { params }),
+  get: (id: string) => api.get(`/contracts/${id}`),
+  create: (data: any) => api.post('/contracts', data),
+  update: (id: string, data: any) => api.patch(`/contracts/${id}`, data),
+  delete: (id: string) => api.delete(`/contracts/${id}`),
+  archive: (id: string) => api.post(`/contracts/${id}/archive`),
+  restore: (id: string) => api.post(`/contracts/${id}/restore`),
+  exportCsv: (params?: any) => api.get('/contracts/export.csv', { params, responseType: 'blob' }),
+  uploadSpec: () => api.get('/contracts/upload/spec'),
+  upload: (formData: FormData) => api.post('/contracts/upload', formData, { headers: { 'Content-Type': 'multipart/form-data' } }),
+};
 
-  async getVendor(id: string): Promise<Vendor> {
-    const { data } = await this.client.get(`/vendors/${id}`);
-    return data;
-  }
+// ---- Reminders ----
+export const reminderApi = {
+  listForContract: (contractId: string) => api.get(`/contracts/${contractId}/reminders`),
+  listAll: (params?: any) => api.get('/reminders', { params }),
+  create: (contractId: string, data: any) => api.post(`/contracts/${contractId}/reminders`, data),
+  update: (id: string, data: any) => api.patch(`/reminders/${id}`, data),
+};
 
-  async createVendor(vendor: Partial<Vendor>): Promise<Vendor> {
-    const { data } = await this.client.post('/vendors', vendor);
-    return data;
-  }
+// ---- Dashboard ----
+export const dashboardApi = {
+  summary: () => api.get('/dashboard/summary'),
+};
 
-  async updateVendor(id: string, vendor: Partial<Vendor>): Promise<Vendor> {
-    const { data } = await this.client.patch(`/vendors/${id}`, vendor);
-    return data;
-  }
+// ---- Activity ----
+export const activityApi = {
+  list: (params?: any) => api.get('/activity', { params }),
+};
 
-  async deleteVendor(id: string): Promise<Vendor> {
-    const { data } = await this.client.delete(`/vendors/${id}`);
-    return data;
-  }
+// ---- Documents ----
+export const documentApi = {
+  listForContract: (contractId: string) => api.get(`/contracts/${contractId}/documents`),
+};
 
-  async deactivateVendor(id: string): Promise<Vendor> {
-    const { data } = await this.client.post(`/vendors/${id}/deactivate`, {});
-    return data;
-  }
-
-  // Contracts
-  async getContracts(params?: any): Promise<any> {
-    const { data } = await this.client.get('/contracts', { params });
-    return data;
-  }
-
-  async getContract(id: string): Promise<Contract> {
-    const { data } = await this.client.get(`/contracts/${id}`);
-    return data;
-  }
-
-  async createContract(contract: Partial<Contract>): Promise<Contract> {
-    const { data } = await this.client.post('/contracts', contract);
-    return data;
-  }
-
-  async updateContract(id: string, contract: Partial<Contract>): Promise<Contract> {
-    const { data } = await this.client.patch(`/contracts/${id}`, contract);
-    return data;
-  }
-
-  async archiveContract(id: string): Promise<Contract> {
-    const { data } = await this.client.post(`/contracts/${id}/archive`, {});
-    return data;
-  }
-
-  async restoreContract(id: string): Promise<Contract> {
-    const { data } = await this.client.post(`/contracts/${id}/restore`, {});
-    return data;
-  }
-
-  async deleteContract(id: string): Promise<void> {
-    await this.client.delete(`/contracts/${id}`);
-  }
-
-  // Reminders
-  async getReminders(contractId: string): Promise<any> {
-    const { data } = await this.client.get(`/contracts/${contractId}/reminders`);
-    return data;
-  }
-
-  async createReminder(contractId: string, reminder: Partial<Reminder>): Promise<Reminder> {
-    const { data } = await this.client.post(`/contracts/${contractId}/reminders`, reminder);
-    return data;
-  }
-
-  async updateReminder(id: string, reminder: Partial<Reminder>): Promise<Reminder> {
-    const { data } = await this.client.patch(`/reminders/${id}`, reminder);
-    return data;
-  }
-
-  // Dashboard
-  async getDashboardSummary(): Promise<any> {
-    const { data } = await this.client.get('/dashboard/summary');
-    return data;
-  }
-
-  // Export
-  async exportContractsCsv(): Promise<Blob> {
-    const response = await this.client.get('/contracts/export.csv', {
-      responseType: 'blob'
-    });
-    return response.data;
-  }
-}
-
-export const apiClient = new ApiClient();
+// ---- Users ----
+export const userApi = {
+  list: () => api.get('/users'),
+};
