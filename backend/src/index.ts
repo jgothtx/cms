@@ -4,6 +4,7 @@ import cors from 'cors';
 import path from 'path';
 import apiRouter from './routes';
 import { seed } from './seed';
+import { ensureBucket } from './s3';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3001;
@@ -23,6 +24,7 @@ app.get('*', (_req, res) => {
 
 // Seed on startup
 seed();
+ensureBucket().catch(err => console.error('[S3] Failed to ensure bucket:', err));
 
 app.listen(PORT, () => {
   console.log(`Backend running on http://localhost:${PORT}`);
